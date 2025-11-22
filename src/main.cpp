@@ -1,11 +1,7 @@
-/*
 #include <Arduino.h>
 #include <Wire.h>
-//#include <NimBLEDevice.h>
-//#include <NimBLEAdvertisementData.h> // use ESP NOW to send btwn 2 ESP32s
-#include <esp_now.h>
-#include <WiFi.h>
-#include <esp_wifi.h>
+#include <NimBLEDevice.h>
+#include <NimBLEAdvertisementData.h>
 
 // ---------- I2C pins & ICM20600 config ----------
 #define I2C_SDA 5     // working pins for your Xiao ESP32S3
@@ -22,8 +18,14 @@
 static const float ACC_LSB_PER_G   = 16384.0f; // ±2g
 static const float GYR_LSB_PER_DPS = 131.0f;   // ±250 dps
 
+// ---------- BLE UUIDs required by HTML ----------
+static const NimBLEUUID SVC_UUID ((uint16_t)0xFF00);
+static const NimBLEUUID IMU_UUID ((uint16_t)0xFF01);  // notify
+static const NimBLEUUID CTRL_UUID((uint16_t)0xFF02);  // write
 
 // ---------- Globals ----------
+NimBLECharacteristic* imuChar = nullptr;
+volatile bool streamOn = true;        // toggled by control writes
 const uint32_t PERIOD_MS = 25;         // ~40 Hz
 
 // ---------- I2C helpers ----------
@@ -77,148 +79,102 @@ static bool icmRead(float& ax,float& ay,float& az,
   return true;
 }
 
-typedef struct data_packet {
-    float ax;
-    float ay;
-    float az;
-    float gx;
-    float gy;
-    float gz;
-} data_packet;
-
-data_packet data;
-
-esp_now_peer_info_t receiver; 
-
-uint8_t rxMACaddr[] = {0xB8,0xF8,0x62,0xF9,0xEF,0x64}; // put rx MAC address: b8:f8:62:f9:ef:64
-
-// simple thread-safe handoff for send callback printing
-volatile bool send_event_pending = false;
-uint8_t send_event_mac[6];
-volatile esp_now_send_status_t send_event_status;
-
-void readMacAddress(){
-  uint8_t baseMac[6];
-  esp_err_t ret = esp_wifi_get_mac(WIFI_IF_STA, baseMac);
-  if (ret == ESP_OK) {
-    Serial.printf("%02x:%02x:%02x:%02x:%02x:%02x\n",
-                  baseMac[0], baseMac[1], baseMac[2],
-                  baseMac[3], baseMac[4], baseMac[5]);
-  } else {
-    Serial.println("Failed to read MAC address");
+// ---------- BLE callbacks ----------
+class CbServer : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer*) {
+    Serial.println("[BLE] Central connected");
   }
-}
+  void onDisconnect(NimBLEServer*) {
+    Serial.println("[BLE] Central disconnected");
+    NimBLEDevice::startAdvertising();
+  }
+};
 
-// send callback: do minimal work and stash result for the main loop to print
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  // copy mac and status to globals and mark event pending
-  for (int i = 0; i < 6; ++i) send_event_mac[i] = mac_addr[i];
-  send_event_status = status;
-  send_event_pending = true;
-}
+// no 'override' → works with more NimBLE versions
+class CbCtrl : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* c) {
+    auto v = c->getValue();
+    if (v.size() > 0) {
+      streamOn = (v[0] != 0);  // 0x01 = start, 0x00 = stop
+      Serial.printf("[CTRL] streamOn = %d\n", streamOn ? 1 : 0);
+    }
+  }
+};
 
 void setup() {
-    Serial.begin(115200);
-    Wire.begin(I2C_SDA, I2C_SCL, 400000);
-    uint8_t who = 0;
-    if (icmInit(who)) {
-        Serial.printf("[I2C] ICM20600 OK, WHO_AM_I=0x%02X (addr 0x%02X)\n",
+  Serial.begin(115200);
+  for (int i = 0; i < 60 && !Serial; i++) delay(20);
+  Serial.println("\n[BOOT] HTML-compatible Wand streamer");
+
+  // I2C + IMU
+  Wire.begin(I2C_SDA, I2C_SCL, 400000);
+  uint8_t who = 0;
+  if (icmInit(who)) {
+    Serial.printf("[I2C] ICM20600 OK, WHO_AM_I=0x%02X (addr 0x%02X)\n",
                   who, ICM20600_ADDR);
-    } else {
-        Serial.println("[I2C] ICM init FAILED");
-    }
+  } else {
+    Serial.println("[I2C] ICM init FAILED");
+  }
 
-    WiFi.mode(WIFI_STA);
-    // Ensure transmitter uses same Wi-Fi channel as receiver
-    {
-      int wifi_channel = 1; // change this on both boards if you want a different channel
-      esp_err_t ch_res = esp_wifi_set_channel(wifi_channel, WIFI_SECOND_CHAN_NONE);
-      if (ch_res == ESP_OK) {
-        Serial.printf("WiFi channel set to %d\n", wifi_channel);
-      } else {
-        Serial.printf("Failed to set WiFi channel: 0x%02X\n", ch_res);
-      }
-    }
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("Error initializing ESP-NOW");
-        return; 
-    }
+  // BLE setup
+  NimBLEDevice::init("SwingSense");
+  NimBLEDevice::setMTU(128);             // IMPORTANT for 36-byte packets
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEDevice::setSecurityAuth(false,false,false);
 
-    Serial.println("MAC Address: ");
-    readMacAddress();
+  auto server = NimBLEDevice::createServer();
+  server->setCallbacks(new CbServer());
 
-    memcpy(receiver.peer_addr, rxMACaddr, ESP_NOW_ETH_ALEN);
-    receiver.channel = 1; // match the esp_wifi_set_channel value above
-    receiver.encrypt = false;
+  auto svc = server->createService(SVC_UUID);
+  imuChar = svc->createCharacteristic(
+      IMU_UUID, NIMBLE_PROPERTY::NOTIFY
+  );
+  auto ctrl = svc->createCharacteristic(
+      CTRL_UUID, NIMBLE_PROPERTY::WRITE
+  );
+  ctrl->setCallbacks(new CbCtrl());
+  svc->start();
 
-    esp_now_init(); 
-
-    if (esp_now_add_peer(&receiver) != ESP_OK){
-        Serial.println("Failed to add peer");
-        return;
-    }
-
-    // register send callback to get delivery status
-    esp_err_t reg = esp_now_register_send_cb(OnDataSent);
-    if (reg != ESP_OK) {
-      Serial.printf("Failed to register send callback: 0x%02X\n", reg);
-    } else {
-      Serial.println("Send callback registered");
-    }
+  auto adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(SVC_UUID);
+  NimBLEAdvertisementData scanResp;
+  scanResp.setName("SwingSense");
+  // Add a short manufacturer data field (two bytes) to make discovery reliable
+  // Clients can match this instead of relying on the local name.
+  std::string mfg;
+  mfg.resize(2);
+  mfg[0] = (char)0x12; // arbitrary identifier byte 1
+  mfg[1] = (char)0x34; // arbitrary identifier byte 2
+  scanResp.setManufacturerData(mfg);
+  adv->setScanResponseData(scanResp);
+  adv->setName("SwingSense");
+  // Also set the manufacturer data on the primary advertisement packet
+  adv->setManufacturerData(mfg);
+  adv->start();
+  Serial.println("[BLE] Advertising as SwingSense with svc 0xFF00");
 }
 
 void loop() {
-    static uint32_t last = 0;
-    uint32_t now = millis();
-    if (now - last < PERIOD_MS) {
-        delay(1);
-        return;
-    }
-    last = now;
+  static uint32_t last = 0;
 
-    float ax, ay, az, gx, gy, gz;
-    if (!icmRead(ax, ay, az, gx, gy, gz)) return;
+  if (!streamOn) {
+    delay(5);
+    return;
+  }
 
-    data.ax = ax;
-    data.ay = ay;
-    data.az = az;
-    data.gx = gx;
-    data.gy = gy;
-    data.gz = gz;
-    
-    esp_err_t result = esp_now_send(rxMACaddr, (uint8_t *) &data, sizeof(data));
-    Serial.printf("esp_now_send result: 0x%02X (%s)\n", result, esp_err_to_name(result));
-    if (result != ESP_OK) {
-      Serial.println("failed to send data");
-    } else {
-      Serial.printf("Sent: a[%.2f, %.2f, %.2f] g[%.2f, %.2f, %.2f]\n",
-              data.ax, data.ay, data.az,
-              data.gx, data.gy, data.gz);
-    }
-    // print any pending send callback info (stashed from callback)
-    if (send_event_pending) {
-      // copy flag under assumption of single-writer (callback) single-reader (loop)
-      uint8_t mac[6];
-      for (int i = 0; i < 6; ++i) mac[i] = send_event_mac[i];
-      esp_now_send_status_t st = send_event_status;
-      send_event_pending = false;
+  uint32_t now = millis();
+  if (now - last < PERIOD_MS) {
+    delay(1);
+    return;
+  }
+  last = now;
 
-      Serial.print("Send callback - To: ");
-      for (int i = 0; i < 6; ++i) {
-        Serial.printf("%02X", mac[i]);
-        if (i < 5) Serial.print(":");
-      }
-      Serial.print("  ");
-      if (st == ESP_NOW_SEND_SUCCESS) {
-        Serial.println("Status: ESP_NOW_SEND_SUCCESS");
-      } else {
-        Serial.println("Status: ESP_NOW_SEND_FAIL");
-      }
-    }
-    //Serial.printf("Sent: a[%.2f, %.2f, %.2f] g[%.2f, %.2f, %.2f]\n",
-    //              data.ax, data.ay, data.az,
-    //              data.gx, data.gy, data.gz);
-    
+  float ax, ay, az, gx, gy, gz;
+  if (!icmRead(ax, ay, az, gx, gy, gz)) return;
+
+  // 9 float32 little-endian payload: ax..gz + mx,my,mz (mag set to 0 here)
+  //float mx = 0, my = 0, mz = 0;
+  float vals[6] = { ax, ay, az, gx, gy, gz};
+  imuChar->setValue((uint8_t*)vals, sizeof(vals));  // 24 bytes
+  imuChar->notify();
 }
-
-*/
