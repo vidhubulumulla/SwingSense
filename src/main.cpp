@@ -8,6 +8,8 @@
 #define I2C_SCL 6
 #define ICM20600_ADDR 0x69
 
+#define RECORDING_PIN D7
+
 #define REG_PWR_MGMT_1   0x6B
 #define REG_ACCEL_CONFIG 0x1C
 #define REG_GYRO_CONFIG  0x1B
@@ -101,10 +103,30 @@ class CbCtrl : public NimBLECharacteristicCallbacks {
   }
 };
 
+volatile bool isRecording = false; 
+
+//void change_recording_state() {
+//  isRecording = !isRecording;
+//}
+
+// Debounce settings
+const unsigned long DEBOUNCE_MS = 100;
+
+volatile bool recording_button_flag = false; // set by ISR
+unsigned long last_button_ms = 0;
+
+// Minimal ISR (must be fast)
+void IRAM_ATTR recording_isr() {
+  recording_button_flag = true;
+}
+
 void setup() {
+  pinMode(RECORDING_PIN, INPUT_PULLUP);
+  attachInterrupt(RECORDING_PIN, recording_isr, FALLING);
+
   Serial.begin(115200);
   for (int i = 0; i < 60 && !Serial; i++) delay(20);
-  Serial.println("\n[BOOT] HTML-compatible Wand streamer");
+  Serial.println("\n[BOOT] Computer Compatible Tennis Racket");
 
   // I2C + IMU
   Wire.begin(I2C_SDA, I2C_SCL, 400000);
@@ -176,5 +198,15 @@ void loop() {
   //float mx = 0, my = 0, mz = 0;
   float vals[6] = { ax, ay, az, gx, gy, gz};
   imuChar->setValue((uint8_t*)vals, sizeof(vals));  // 24 bytes
-  imuChar->notify();
+  if (recording_button_flag) {
+    unsigned long now = millis();          // safe in loop/context
+    if (now - last_button_ms > DEBOUNCE_MS) {
+      isRecording = !isRecording;          // toggle your recording flag
+      last_button_ms = now;
+    }
+    recording_button_flag = false;         // clear flag
+  }
+  if(isRecording) {
+    imuChar->notify();
+  }
 }
