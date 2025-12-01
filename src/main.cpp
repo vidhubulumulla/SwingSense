@@ -103,26 +103,19 @@ class CbCtrl : public NimBLECharacteristicCallbacks {
   }
 };
 
-volatile bool isRecording = false; 
-
-//void change_recording_state() {
-//  isRecording = !isRecording;
-//}
+volatile bool isRecording = false;
 
 // Debounce settings
 const unsigned long DEBOUNCE_MS = 100;
 
-volatile bool recording_button_flag = false; // set by ISR
-unsigned long last_button_ms = 0;
+// For a toggle switch (maintained state) we sample the pin and debounce
+int last_switch_state = HIGH;           // INPUT_PULLUP default
+unsigned long last_debounce_time = 0;
 
-// Minimal ISR (must be fast)
-void IRAM_ATTR recording_isr() {
-  recording_button_flag = true;
-}
+// (no header-state tracking) we always explicitly send a header on state change
 
 void setup() {
   pinMode(RECORDING_PIN, INPUT_PULLUP);
-  attachInterrupt(RECORDING_PIN, recording_isr, FALLING);
 
   Serial.begin(115200);
   for (int i = 0; i < 60 && !Serial; i++) delay(20);
@@ -194,19 +187,38 @@ void loop() {
   float ax, ay, az, gx, gy, gz;
   if (!icmRead(ax, ay, az, gx, gy, gz)) return;
 
-  // 9 float32 little-endian payload: ax..gz + mx,my,mz (mag set to 0 here)
-  //float mx = 0, my = 0, mz = 0;
-  float vals[6] = { ax, ay, az, gx, gy, gz};
-  imuChar->setValue((uint8_t*)vals, sizeof(vals));  // 24 bytes
-  if (recording_button_flag) {
-    unsigned long now = millis();          // safe in loop/context
-    if (now - last_button_ms > DEBOUNCE_MS) {
-      isRecording = !isRecording;          // toggle your recording flag
-      last_button_ms = now;
-    }
-    recording_button_flag = false;         // clear flag
+  float vals[6] = { ax, ay, az, gx, gy, gz };
+
+  // --- Read toggle switch (debounced) ---
+  int pin_read = digitalRead(RECORDING_PIN);
+  if (pin_read != last_switch_state) {
+    last_debounce_time = millis();
+    last_switch_state = pin_read;
   }
-  if(isRecording) {
+
+  bool justToggled = false;
+
+  if (millis() - last_debounce_time > DEBOUNCE_MS) {
+    bool newRecording = (pin_read == LOW); // active-low
+    if (newRecording != isRecording) {
+      isRecording = newRecording;
+      justToggled = true;
+      Serial.printf("[REC] isRecording = %d\n", isRecording ? 1 : 0);
+
+      if (imuChar) {
+        uint8_t hdrByte = isRecording ? 0x01 : 0x02;
+        imuChar->setValue(&hdrByte, 1);
+        imuChar->notify();  // send exactly ONE header per toggle
+        Serial.printf("[REC] Sent header: 0x%02X (isRecording=%d)\n",
+                      hdrByte, isRecording ? 1 : 0);
+      }
+    }
+  }
+
+  // Only send IMU data when recording and NOT on the exact toggle iteration
+  if (isRecording && !justToggled && imuChar) {
+    imuChar->setValue((uint8_t*)vals, sizeof(vals));  // 24-byte data packet
     imuChar->notify();
   }
 }
+
