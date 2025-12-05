@@ -6,10 +6,19 @@ import time
 import os
 import threading
 import sys
+import traceback
 
 IMU_SVC_UUID = "0000ff00-0000-1000-8000-00805f9b34fb"
 IMU_CHAR_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
 TARGET_MFG = bytes([0x12, 0x34])
+
+# Reconnect/backoff tuning
+RECONNECT_INITIAL_BACKOFF = 0.2  # seconds (start retry quickly)
+RECONNECT_MAX_BACKOFF = 5.0      # seconds (cap backoff to keep retries responsive)
+RECONNECT_MULTIPLIER = 1.5       # increase factor on each failed attempt
+# Scanning / retry tuning
+SCAN_TIMEOUT = 5.0               # seconds for BleakScanner.find_device_by_filter
+NO_DEVICE_RETRY_SLEEP = 0.5      # seconds to wait before trying scan again when no device
 
 # Recording/file state
 recording = False
@@ -144,40 +153,106 @@ async def _is_connected(client):
 
 
 async def connect_and_listen(device):
-    backoff = 1.0
+    backoff = RECONNECT_INITIAL_BACKOFF
     while True:
         try:
             addr = getattr(device, 'address', str(device))
             print(f"Connecting to {addr}...")
-            async with BleakClient(device) as client:
-                connected = await _is_connected(client)
-                print("Connected:", connected)
+            client = BleakClient(device)
+
+            # disconnected callback for immediate diagnostics
+            def _on_disconnect(c):
+                try:
+                    a = getattr(c, 'address', None)
+                    print(f"[DISCONNECTED CALLBACK] client {a} disconnected")
+                except Exception:
+                    print("[DISCONNECTED CALLBACK] client disconnected")
+
+            try:
+                client.set_disconnected_callback(_on_disconnect)
+            except Exception:
+                # some backends may not support this; ignore if not available
+                pass
+
+            try:
+                await client.connect()
+            except Exception as e:
+                print("Failed to connect:", e)
+                traceback.print_exc()
+                raise
+
+            connected = await _is_connected(client)
+            print("Connected:", connected)
+
+            # list services and check characteristic availability for debugging
+            '''
+            try:
+                services = await client.get_services()      
+                print("Discovered services and characteristics:")
+                found_char = False
+                for svc in services:
+                    for ch in svc.characteristics:
+                        print(f"  svc {svc.uuid} ch {ch.uuid} {'(notify)' if 'notify' in ch.properties else ''}")
+                        if ch.uuid.lower() == IMU_CHAR_UUID.lower():
+                            found_char = True
+                if not found_char:
+                    print(f"Warning: IMU characteristic {IMU_CHAR_UUID} not found on device")
+            except Exception as e:
+                print("Error enumerating services:", e)
+                traceback.print_exc()
+            '''
+
+            try:
                 await client.start_notify(IMU_CHAR_UUID, handle_notification)
                 print("Started notifications. Listening... (Ctrl+C to quit)")
-                # stay connected until disconnected
-                while await _is_connected(client):
-                    await asyncio.sleep(1)
-                print("Disconnected from peripheral")
+            except Exception as e:
+                print("Failed to start notifications:", e)
+                traceback.print_exc()
+                # clean up and raise to trigger reconnect/backoff
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                raise
+
+            # stay connected until disconnected; poll quickly to detect disconnect
+            while await _is_connected(client):
+                await asyncio.sleep(0.2)
+            print("Disconnected from peripheral")
+
+            # attempt graceful cleanup
+            try:
+                await client.stop_notify(IMU_CHAR_UUID)
+            except Exception:
+                pass
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
         except Exception as e:
             print("Connection error:", e)
-        print(f"Reconnecting in {backoff:.1f}s...")
+            traceback.print_exc()
+        # Wait a short time before reconnecting; use a small initial backoff and
+        # moderate exponential growth but cap it so retries stay responsive.
+        print(f"Reconnecting in {backoff:.2f}s...")
         await asyncio.sleep(backoff)
-        backoff = min(backoff * 2.0, 30.0)
+        backoff = min(backoff * RECONNECT_MULTIPLIER, RECONNECT_MAX_BACKOFF)
 
 
 async def main():
     print("Receiver starting — press Ctrl+C to stop")
     while True:
-        dev = await find_swing_device(timeout=20.0)
+        dev = await find_swing_device(timeout=SCAN_TIMEOUT)
         if dev is None:
-            print("Device not found. Retrying in 5s...")
-            await asyncio.sleep(5)
+            # shorten the interval when no device is found so we retry faster
+            print(f"Device not found. Retrying in {NO_DEVICE_RETRY_SLEEP:.1f}s...")
+            await asyncio.sleep(NO_DEVICE_RETRY_SLEEP)
             continue
 
         name = getattr(dev, 'name', None)
         print(f"Found device: {name} [{dev.address}]")
         # attempt connection and listen (this blocks until disconnect)
-        await connect_and_listen(dev.address)
+        await connect_and_listen(dev)
 
 
 if __name__ == '__main__':

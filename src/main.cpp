@@ -8,7 +8,7 @@
 #define I2C_SCL 6
 #define ICM20600_ADDR 0x69
 
-#define RECORDING_PIN D7
+#define RECORDING_PIN D9
 
 #define REG_PWR_MGMT_1   0x6B
 #define REG_ACCEL_CONFIG 0x1C
